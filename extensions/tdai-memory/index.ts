@@ -23,6 +23,7 @@ import {
   normalizeEntries,
   splitBatches,
   DEFAULT_BUDGET_CHARS,
+  type ScenarioEntry,
 } from "./lib.js";
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -119,6 +120,7 @@ const result = (data: unknown) => ({
 
 // ── L2/L3 injection (before_agent_start) ────────────────────────────────────
 async function buildMemoryBlock(cwd: string): Promise<string> {
+  if (!API_KEY) return "";
   // L3 core persona (fail-open: absence -> null).
   let core: string | null = null;
   try {
@@ -129,13 +131,13 @@ async function buildMemoryBlock(cwd: string): Promise<string> {
   }
 
   // L2 scenario list -> select paths for this cwd -> read each.
-  let entries: { path: string; summary?: string }[] = [];
+  let entries: ScenarioEntry[] = [];
   try {
     const r = (await call(GATEWAY_URL, "/v3/scenario/ls", { ...idFields(), path_prefix: "" }, true)) as {
-      entries?: { path?: string; summary?: string }[];
+      entries?: ScenarioEntry[];
     };
     entries = (r?.entries ?? [])
-      .filter((e): e is { path: string; summary?: string } => typeof e?.path === "string")
+      .filter((e): e is ScenarioEntry => typeof e?.path === "string")
       .map((e) => ({ path: e.path, summary: e.summary }));
   } catch {
     /* no L2 */
@@ -160,6 +162,7 @@ function lastCapturedEntryId(ctx: ExtensionContext): string | null {
 }
 
 async function captureSession(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
+  if (!API_KEY) return;
   const entries = ctx.sessionManager.getEntries();
   const lastId = lastCapturedEntryId(ctx);
   const lastIdx = lastId ? entries.findIndex((e) => e.id === lastId) : -1;

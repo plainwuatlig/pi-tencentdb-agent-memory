@@ -49,7 +49,12 @@ interface ContentPart {
 export function chunkContent(s: string, max: number = MAX_MSG_CHARS): string[] {
   if (s.length === 0) return [];
   const out: string[] = [];
-  for (let i = 0; i < s.length; i += max) out.push(s.slice(i, i + max));
+  for (let i = 0; i < s.length; i += max) {
+    let end = i + max;
+    // Don't split a UTF-16 surrogate pair at the boundary (e.g. emoji).
+    if (end < s.length && s.charCodeAt(end) >= 0xdc00 && s.charCodeAt(end) <= 0xdfff) end -= 1;
+    out.push(s.slice(i, end));
+  }
   return out;
 }
 
@@ -107,11 +112,6 @@ function safeJson(v: unknown): string {
   }
 }
 
-/**
- * Assemble the <tdai-memory> prompt block from L3 core + selected L2 scenarios,
- * within budgetChars. L3 first, then scenarios in order, skipping any that don't fit.
- * Returns "" when there is nothing to inject.
- */
 /** One L2 scenario line: path + optional ≤SUMMARY_MAX-char summary (proxy-faithful). */
 function scenarioLine(s: ScenarioEntry): string {
   const summary = (s.summary ?? "").trim().slice(0, SUMMARY_MAX);
