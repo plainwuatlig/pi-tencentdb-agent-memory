@@ -2,7 +2,9 @@ import { test, expect } from "bun:test";
 
 // Configure the extension BEFORE importing it (it reads config at module load).
 process.env.TDAI_GATEWAY_URL = "http://tdai.test";
+process.env.TDAI_KNOWLEDGE_URL = "http://tdai-knowledge.test";
 process.env.TDAI_API_KEY = "fake-key";
+process.env.TDAI_SERVICE_ID = "default";
 process.env.TDAI_TEAM_ID = "team-test";
 process.env.TDAI_USER_ID = "usr-test";
 process.env.TDAI_AGENT_ID = "agt-test";

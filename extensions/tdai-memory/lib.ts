@@ -198,3 +198,20 @@ export function normalizeEntries(entries: SessionEntryLike[]): L0Message[] {
 
   return out;
 }
+
+// ── Config validation (fail-fast: no silent defaults) ───────────────────────
+/** Env vars the extension requires. If any is unset, the extension refuses to load. */
+export const REQUIRED_ENV = [
+  "TDAI_API_KEY",
+  "TDAI_GATEWAY_URL",
+  "TDAI_KNOWLEDGE_URL",
+  "TDAI_SERVICE_ID",
+  "TDAI_TEAM_ID",
+  "TDAI_USER_ID",
+  "TDAI_AGENT_ID",
+] as const;
+
+/** Return the required env vars that are unset/empty in `env`. Empty array = all present. */
+export function missingRequiredEnv(env: Record<string, string | undefined>): string[] {
+  return REQUIRED_ENV.filter((k) => !env[k]);
+}

@@ -39,14 +39,14 @@ Team-scoped (shared, auto-installed on startup for trusted projects): add `-l` �
 
 ## Configuration
 
-All config is via environment variables; **no defaults are baked into this repo** (set your gateway + identity).
+All config is via environment variables. **Fail-fast, no defaults:** the seven “yes” vars below are required — if any is unset the extension **refuses to load** (pi shows `Failed to load extension "…/tdai-memory/index.ts": missing …` and continues without it). Set them in the shell that launches pi.
 
 | Var | Required | Description |
 |---|---|---|
 | `TDAI_API_KEY` | yes | Per-user key (`sk-mem-…`), sent as Bearer to the memory gateway |
 | `TDAI_GATEWAY_URL` | yes | Memory gateway base URL |
 | `TDAI_KNOWLEDGE_URL` | yes | Knowledge (wiki) service base URL |
-| `TDAI_SERVICE_ID` | no | Defaults to `default` |
+| `TDAI_SERVICE_ID` | yes | Service id (`x-tdai-service-id` header), e.g. `default` |
 | `TDAI_TEAM_ID` / `TDAI_USER_ID` / `TDAI_AGENT_ID` | yes | Tenant identity triple, sent with every request |
 | `TDAI_INJECT` | no | `on` (default) / `off` — L2/L3 system-prompt injection |
 | `TDAI_CAPTURE` | no | `on` (default) / `off` — automatic L0 capture at shutdown |
