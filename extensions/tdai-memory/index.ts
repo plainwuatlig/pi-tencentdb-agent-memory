@@ -5,11 +5,11 @@
  * Exposes the memory gateway and knowledge (wiki) service as
  * native pi tools.
  *
- * Env (all required; no defaults are baked into this repo):
+ * Env (all required — the extension fails to load if any are missing; no defaults):
  *   TDAI_GATEWAY_URL    memory gateway base URL
  *   TDAI_KNOWLEDGE_URL  knowledge (wiki) service base URL
  *   TDAI_API_KEY        sk-mem-… (per-user key, Bearer for gateway)
- *   TDAI_SERVICE_ID     optional, default "default"
+ *   TDAI_SERVICE_ID     service id (x-tdai-service-id header), e.g. "default"
  *   TDAI_TEAM_ID        team-… (tenant identity, sent with every request)
  *   TDAI_USER_ID        usr-…
  *   TDAI_AGENT_ID       agt-…
@@ -22,20 +22,28 @@ import {
   selectScenarioPaths,
   normalizeEntries,
   splitBatches,
+  missingRequiredEnv,
   DEFAULT_BUDGET_CHARS,
   type ScenarioEntry,
 } from "./lib.js";
 
-// ── Config ──────────────────────────────────────────────────────────────────
-const GATEWAY_URL =
-  process.env.TDAI_GATEWAY_URL ?? "";
-const KNOWLEDGE_URL =
-  process.env.TDAI_KNOWLEDGE_URL ?? "";
-const API_KEY = process.env.TDAI_API_KEY ?? "";
-const SERVICE_ID = process.env.TDAI_SERVICE_ID ?? "default";
-const TEAM_ID = process.env.TDAI_TEAM_ID ?? "";
-const USER_ID = process.env.TDAI_USER_ID ?? "";
-const AGENT_ID = process.env.TDAI_AGENT_ID ?? "";
+// ── Config (fail-fast: every external var is required, no silent defaults) ──
+// Missing required var -> throw at load -> pi reports "Failed to load extension:
+// <msg>" and continues without this extension.
+const missing = missingRequiredEnv(process.env);
+if (missing.length > 0) {
+  throw new Error(
+    `tdai-memory: missing required env var(s): ${missing.join(", ")}. ` +
+    "Set them (see README) and restart pi.",
+  );
+}
+const API_KEY = process.env.TDAI_API_KEY as string;
+const GATEWAY_URL = process.env.TDAI_GATEWAY_URL as string;
+const KNOWLEDGE_URL = process.env.TDAI_KNOWLEDGE_URL as string;
+const SERVICE_ID = process.env.TDAI_SERVICE_ID as string;
+const TEAM_ID = process.env.TDAI_TEAM_ID as string;
+const USER_ID = process.env.TDAI_USER_ID as string;
+const AGENT_ID = process.env.TDAI_AGENT_ID as string;
 const TIMEOUT_MS = 60_000; // first request per serviceId can cold-start a store
 
 // ── Behavior (L2/L3 injection + L0 capture) — both on by default; kill switches below
@@ -120,7 +128,6 @@ const result = (data: unknown) => ({
 
 // ── L2/L3 injection (before_agent_start) ────────────────────────────────────
 async function buildMemoryBlock(cwd: string): Promise<string> {
-  if (!API_KEY) return "";
   // L3 core persona (fail-open: absence -> null).
   let core: string | null = null;
   try {
@@ -162,7 +169,6 @@ function lastCapturedEntryId(ctx: ExtensionContext): string | null {
 }
 
 async function captureSession(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
-  if (!API_KEY) return;
   const entries = ctx.sessionManager.getEntries();
   const lastId = lastCapturedEntryId(ctx);
   const lastIdx = lastId ? entries.findIndex((e) => e.id === lastId) : -1;
@@ -187,15 +193,6 @@ async function captureSession(ctx: ExtensionContext, pi: ExtensionAPI): Promise<
 
 // ── Extension ───────────────────────────────────────────────────────────────
 export default function tdaiMemoryExtension(pi: ExtensionAPI) {
-  if (!API_KEY) {
-    pi.on("session_start", (_event, ctx) => {
-      ctx.ui.notify(
-        "tdai-memory: TDAI_API_KEY not set — memory tools won't work",
-        "warning",
-      );
-    });
-  }
-
   // ── tdai_search — L1 memory semantic search ───────────────────────────────
   pi.registerTool({
     name: "tdai_search",

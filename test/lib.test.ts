@@ -5,6 +5,8 @@ import {
   selectScenarioPaths,
   assembleMemoryBlock,
   normalizeEntries,
+  missingRequiredEnv,
+  REQUIRED_ENV,
   MAX_MSG_CHARS,
   MAX_MSGS_PER_POST,
   type L0Message,
@@ -191,4 +193,33 @@ test("normalizeEntries: long content is chunked to <= 8192 chars, no loss", () =
 test("normalizeEntries: empty content is dropped", () => {
   const out = normalizeEntries([msg("assistant", [{ type: "thinking", thinking: "only thinking" }])]);
   expect(out).toEqual([]);
+});
+
+// ── missingRequiredEnv (fail-fast) ──────────────────────────────────────────
+const fullEnv: Record<string, string> = {
+  TDAI_API_KEY: "k",
+  TDAI_GATEWAY_URL: "http://gw",
+  TDAI_KNOWLEDGE_URL: "http://kn",
+  TDAI_SERVICE_ID: "default",
+  TDAI_TEAM_ID: "team",
+  TDAI_USER_ID: "usr",
+  TDAI_AGENT_ID: "agt",
+};
+
+test("missingRequiredEnv: all set -> []", () => {
+  expect(missingRequiredEnv(fullEnv)).toEqual([]);
+});
+
+test("missingRequiredEnv: none set -> the full REQUIRED_ENV list", () => {
+  expect(missingRequiredEnv({})).toEqual([...REQUIRED_ENV]);
+});
+
+test("missingRequiredEnv: reports exactly the unset ones", () => {
+  const rest: Record<string, string> = { ...fullEnv };
+  delete rest.TDAI_GATEWAY_URL;
+  expect(missingRequiredEnv(rest)).toEqual(["TDAI_GATEWAY_URL"]);
+});
+
+test("missingRequiredEnv: empty string counts as missing", () => {
+  expect(missingRequiredEnv({ ...fullEnv, TDAI_API_KEY: "" })).toEqual(["TDAI_API_KEY"]);
 });
