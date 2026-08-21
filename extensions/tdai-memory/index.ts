@@ -15,8 +15,16 @@
  *   TDAI_AGENT_ID       agt-…
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import {
+  assembleMemoryBlock,
+  selectScenarioPaths,
+  normalizeEntries,
+  splitBatches,
+  DEFAULT_BUDGET_CHARS,
+  type ScenarioEntry,
+} from "./lib.js";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 const GATEWAY_URL =
@@ -29,6 +37,21 @@ const TEAM_ID = process.env.TDAI_TEAM_ID ?? "";
 const USER_ID = process.env.TDAI_USER_ID ?? "";
 const AGENT_ID = process.env.TDAI_AGENT_ID ?? "";
 const TIMEOUT_MS = 60_000; // first request per serviceId can cold-start a store
+
+// ── Behavior (L2/L3 injection + L0 capture) — both on by default; kill switches below
+const INJECT_ENABLED = process.env.TDAI_INJECT !== "0";
+const CAPTURE_ENABLED = process.env.TDAI_CAPTURE !== "0";
+const INJECT_BUDGET_CHARS = Number(process.env.TDAI_INJECT_MAX_CHARS ?? DEFAULT_BUDGET_CHARS);
+
+function scenarioMap(): Record<string, string[]> | undefined {
+  const raw = process.env.TDAI_SCENARIO_MAP;
+  if (!raw) return undefined;
+  try {
+    return JSON.parse(raw) as Record<string, string[]>;
+  } catch {
+    return undefined; // invalid JSON -> fall back to inject-all
+  }
+}
 
 // ── HTTP helper ─────────────────────────────────────────────────────────────
 async function call(
@@ -94,6 +117,73 @@ const result = (data: unknown) => ({
   content: [{ type: "text" as const, text: format(data) }],
   details: {},
 });
+
+// ── L2/L3 injection (before_agent_start) ────────────────────────────────────
+async function buildMemoryBlock(cwd: string): Promise<string> {
+  if (!API_KEY) return "";
+  // L3 core persona (fail-open: absence -> null).
+  let core: string | null = null;
+  try {
+    const r = (await call(GATEWAY_URL, "/v3/core/read", idFields(), true)) as { content?: unknown };
+    if (typeof r?.content === "string") core = r.content;
+  } catch {
+    /* no L3 */
+  }
+
+  // L2 scenario list -> select paths for this cwd -> read each.
+  let entries: ScenarioEntry[] = [];
+  try {
+    const r = (await call(GATEWAY_URL, "/v3/scenario/ls", { ...idFields(), path_prefix: "" }, true)) as {
+      entries?: ScenarioEntry[];
+    };
+    entries = (r?.entries ?? [])
+      .filter((e): e is ScenarioEntry => typeof e?.path === "string")
+      .map((e) => ({ path: e.path, summary: e.summary }));
+  } catch {
+    /* no L2 */
+  }
+
+  const selected = selectScenarioPaths(entries, cwd, scenarioMap());
+  const scenarios = selected.map((p) => ({ path: p, summary: entries.find((e) => e.path === p)?.summary }));
+
+  return assembleMemoryBlock({ core, scenarios, budgetChars: INJECT_BUDGET_CHARS });
+}
+
+// ── L0 capture (session_shutdown) ───────────────────────────────────────────
+const CAPTURE_TYPE = "tdai-capture";
+
+function lastCapturedEntryId(ctx: ExtensionContext): string | null {
+  const entries = ctx.sessionManager.getEntries();
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const e = entries[i] as { type: string; customType?: string; data?: { lastEntryId?: string } };
+    if (e.type === "custom" && e.customType === CAPTURE_TYPE) return e.data?.lastEntryId ?? null;
+  }
+  return null;
+}
+
+async function captureSession(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
+  if (!API_KEY) return;
+  const entries = ctx.sessionManager.getEntries();
+  const lastId = lastCapturedEntryId(ctx);
+  const lastIdx = lastId ? entries.findIndex((e) => e.id === lastId) : -1;
+  const fresh = lastIdx === -1 ? entries : entries.slice(lastIdx + 1);
+  if (fresh.length === 0) return;
+
+  const messages = normalizeEntries(fresh as Parameters<typeof normalizeEntries>[0]);
+  for (const batch of splitBatches(messages)) {
+    if (batch.length > 0) {
+      await call(
+        GATEWAY_URL,
+        "/v3/conversation/add",
+        { ...idFields(), session_id: ctx.sessionManager.getSessionId(), messages: batch },
+        true,
+      );
+    }
+  }
+
+  // Record how far we've captured so a later shutdown doesn't blindly re-send.
+  pi.appendEntry(CAPTURE_TYPE, { lastEntryId: fresh[fresh.length - 1].id, ts: Date.now() });
+}
 
 // ── Extension ───────────────────────────────────────────────────────────────
 export default function tdaiMemoryExtension(pi: ExtensionAPI) {
@@ -302,6 +392,30 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI) {
       return result(data);
     },
   });
+
+  // ── Behavior: L2/L3 injection + L0 capture (fail-open) ───────────────────
+  if (INJECT_ENABLED) {
+    pi.on("before_agent_start", async (event) => {
+      try {
+        const cwd = event.systemPromptOptions?.cwd ?? process.cwd();
+        const block = await buildMemoryBlock(cwd);
+        if (!block) return;
+        return { systemPrompt: `${event.systemPrompt}\n\n${block}` };
+      } catch {
+        return; // fail-open: a memory outage must never block the agent
+      }
+    });
+  }
+
+  if (CAPTURE_ENABLED) {
+    pi.on("session_shutdown", async (_event, ctx) => {
+      try {
+        await captureSession(ctx, pi);
+      } catch {
+        // fail-open: capture must never block quit/replacement
+      }
+    });
+  }
 
   // ── Status on start ───────────────────────────────────────────────────────
   pi.on("session_start", (_event, ctx) => {
