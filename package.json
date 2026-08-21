@@ -1,5 +1,5 @@
 {
-  "name": "@plainwu/pi-tencentdb-agent-memory",
+  "name": "@plainwuatlig/pi-tencentdb-agent-memory",
   "version": "0.1.0",
   "description": "TencentDB Agent Memory (tdai) for pi: 8 memory/knowledge tools + automatic L0 conversation capture + budgeted L2/L3 prompt injection.",
   "type": "module",

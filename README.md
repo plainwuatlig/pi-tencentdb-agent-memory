@@ -28,11 +28,11 @@ Everything is **fail-open**: any tdai outage, timeout, or unset key degrades to 
 Via pi (recommended):
 
 ```
-pi install npm:@plainwu/pi-tencentdb-agent-memory
+pi install npm:@plainwuatlig/pi-tencentdb-agent-memory
 # or from git:
 pi install git:github.com/plainwuatlig/pi-tencentdb-agent-memory@v0.1.0
 # try without installing:
-pi -e npm:@plainwu/pi-tencentdb-agent-memory
+pi -e npm:@plainwuatlig/pi-tencentdb-agent-memory
 ```
 
 Team-scoped (shared, auto-installed on startup for trusted projects): add `-l` — writes `.pi/settings.json`.
