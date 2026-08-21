@@ -7,18 +7,16 @@
 export const MAX_MSG_CHARS = 8192; // tdai conversation/add: content 1..8192 JS chars
 export const MAX_MSGS_PER_POST = 100; // tdai conversation/add: 1..100 messages per POST
 export const DEFAULT_BUDGET_CHARS = 16000; // ~4K tokens of injected memory
+export const SUMMARY_MAX = 200; // L2 summary length cap (proxy renders path + ≤200-char summary, no body)
 
 export interface ScenarioEntry {
   path: string;
   summary?: string;
 }
-export interface ScenarioContent {
-  path: string;
-  content: string;
-}
 export interface MemoryBlockInput {
   core?: string | null;
-  scenarios: ScenarioContent[];
+  /** L2 scenarios to inject: path + optional summary (proxy-faithful: path + ≤200-char summary, no full body). */
+  scenarios: ScenarioEntry[];
   budgetChars?: number;
 }
 export interface L0Message {
@@ -114,37 +112,47 @@ function safeJson(v: unknown): string {
  * within budgetChars. L3 first, then scenarios in order, skipping any that don't fit.
  * Returns "" when there is nothing to inject.
  */
+/** One L2 scenario line: path + optional ≤SUMMARY_MAX-char summary (proxy-faithful). */
+function scenarioLine(s: ScenarioEntry): string {
+  const summary = (s.summary ?? "").trim().slice(0, SUMMARY_MAX);
+  return summary ? `- ${s.path}: ${summary}` : `- ${s.path}`;
+}
+
+/**
+ * Assemble the <tdai-memory> prompt block: L3 core (full, truncated to fit) first,
+ * then selected L2 scenarios as "path: summary" lines, within budgetChars.
+ * Returns "" when there is nothing to inject.
+ */
 export function assembleMemoryBlock(input: MemoryBlockInput): string {
-  const { core, scenarios } = input;
   const budget = input.budgetChars ?? DEFAULT_BUDGET_CHARS;
   const header = "<tdai-memory>\n";
   const footer = "\n</tdai-memory>";
 
-  const coreText = stripSceneNav((core ?? "").trim());
-  const scenes = scenarios.filter((s) => (s.content ?? "").trim().length > 0);
+  const coreText = stripSceneNav((input.core ?? "").trim());
+  const scenes = input.scenarios.filter((s) => s.path);
   if (!coreText && scenes.length === 0) return "";
 
-  // Core section (truncated to fit on its own if the persona alone exceeds the budget).
-  let coreSection: string | null = null;
+  // L3 core first, truncated to fit on its own.
+  let coreBlock = "";
   if (coreText) {
     const coreLine = "### Core\n";
     const allow = Math.max(0, budget - header.length - footer.length - coreLine.length);
-    coreSection = `### Core\n${allow >= coreText.length ? coreText : coreText.slice(0, allow)}`;
+    coreBlock = `### Core\n${allow >= coreText.length ? coreText : coreText.slice(0, allow)}`;
   }
 
-  const render = (chosen: string[]) => {
-    const parts = [...(coreSection ? [coreSection] : []), ...chosen];
-    return header + parts.join("\n\n") + footer;
+  const render = (lines: string[]) => {
+    const blocks = [...(coreBlock ? [coreBlock] : []), ...(lines.length ? [`### Scenarios\n${lines.join("\n")}`] : [])];
+    return header + blocks.join("\n\n") + footer;
   };
 
-  // Add scenario sections in order, skipping any that would exceed the budget.
-  const chosen: string[] = [];
+  // L2 lines, added in order while within budget.
+  const lines: string[] = [];
   for (const s of scenes) {
-    const section = `### Project: ${s.path}\n${(s.content ?? "").trim()}`;
-    if (render([...chosen, section]).length <= budget) chosen.push(section);
+    const line = scenarioLine(s);
+    if (render([...lines, line]).length <= budget) lines.push(line);
   }
 
-  return render(chosen);
+  return render(lines);
 }
 
 /**

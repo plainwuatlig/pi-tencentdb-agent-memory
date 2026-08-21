@@ -93,13 +93,13 @@ test("selectScenarioPaths: map present but no prefix match -> inject all", () =>
 // ── assembleMemoryBlock ──────────────────────────────────────────────────────
 test("assembleMemoryBlock: nothing to inject -> empty string", () => {
   expect(assembleMemoryBlock({ core: null, scenarios: [] })).toBe("");
-  expect(assembleMemoryBlock({ core: "", scenarios: [{ path: "p.md", content: "" }] })).toBe("");
+  expect(assembleMemoryBlock({ core: "", scenarios: [] })).toBe("");
 });
 
 test("assembleMemoryBlock: core + scenario, within budget, correct shape", () => {
   const block = assembleMemoryBlock({
     core: "I am the core persona.",
-    scenarios: [{ path: "工作/pi.md", content: "project facts" }],
+    scenarios: [{ path: "工作/pi.md", summary: "project facts" }],
   });
   expect(block).toContain("I am the core persona.");
   expect(block).toContain("project facts");
@@ -111,7 +111,7 @@ test("assembleMemoryBlock: core + scenario, within budget, correct shape", () =>
 test("assembleMemoryBlock: core before scenarios in output order", () => {
   const block = assembleMemoryBlock({
     core: "CORE_MARKER",
-    scenarios: [{ path: "s.md", content: "SCENE_MARKER" }],
+    scenarios: [{ path: "s.md", summary: "SCENE_MARKER" }],
   });
   expect(block.indexOf("CORE_MARKER")).toBeLessThan(block.indexOf("SCENE_MARKER"));
 });
@@ -123,19 +123,18 @@ test("assembleMemoryBlock: strips a trailing '## 🗺️' scene-nav block from c
 });
 
 test("assembleMemoryBlock: drops scenarios that exceed the budget", () => {
-  const big = "z".repeat(5000);
-  const block = assembleMemoryBlock({
-    core: "core",
-    scenarios: [
-      { path: "fits.md", content: "small" },
-      { path: "big.md", content: big },
-    ],
-    budgetChars: 2000,
-  });
-  expect(block.length).toBeLessThanOrEqual(2000);
+  const scenarios = Array.from({ length: 8 }, (_, i) => ({ path: `s${i}.md`, summary: "x".repeat(60) }));
+  const block = assembleMemoryBlock({ core: "core", scenarios, budgetChars: 400 });
+  expect(block.length).toBeLessThanOrEqual(400);
   expect(block).toContain("core");
-  expect(block).toContain("small"); // fits before the big one
-  expect(block).not.toContain("zzzzzz");
+  expect(block).toContain("s0.md");
+  expect(block).not.toContain("s7.md"); // later ones dropped
+});
+
+test("assembleMemoryBlock: truncates L2 summaries to 200 chars", () => {
+  const block = assembleMemoryBlock({ core: null, scenarios: [{ path: "p.md", summary: "y".repeat(500) }] });
+  expect(block).toContain("y".repeat(200));
+  expect(block).not.toContain("y".repeat(201));
 });
 
 // ── normalizeEntries ─────────────────────────────────────────────────────────
