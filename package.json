@@ -1,8 +1,15 @@
 {
-  "name": "pi-tencentdb-agent-memory",
+  "name": "@plainwu/pi-tencentdb-agent-memory",
   "version": "0.1.0",
   "description": "TencentDB Agent Memory (tdai) for pi: 8 memory/knowledge tools + automatic L0 conversation capture + budgeted L2/L3 prompt injection.",
   "type": "module",
+  "license": "MIT",
+  "author": "Plain Wu",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/plainwuatlig/pi-tencentdb-agent-memory.git"
+  },
+  "homepage": "https://github.com/plainwuatlig/pi-tencentdb-agent-memory#readme",
   "keywords": [
     "pi-package",
     "pi",
@@ -16,9 +23,18 @@
       "./extensions"
     ]
   },
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "prepublishOnly": "bun run typecheck && bun test"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "peerDependencies": {
     "typebox": "*",
