@@ -1,16 +1,31 @@
 {
   "name": "pi-tencentdb-agent-memory",
   "version": "0.1.0",
-  "private": true,
+  "description": "TencentDB Agent Memory (tdai) for pi: 8 memory/knowledge tools + automatic L0 conversation capture + budgeted L2/L3 prompt injection.",
   "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "extension",
+    "tencentdb",
+    "agent-memory",
+    "tdai"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "bun test"
   },
-  "dependencies": {
-    "typebox": "^1.3.7"
+  "peerDependencies": {
+    "typebox": "*",
+    "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
+    "typebox": "^1.3.7",
     "@earendil-works/pi-coding-agent": "0.84.2",
     "@types/node": "^22.0.0",
     "typescript": "^5.9.3"
