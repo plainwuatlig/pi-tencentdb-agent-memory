@@ -15,7 +15,10 @@
  *   TDAI_AGENT_ID       agt-…
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
   assembleMemoryBlock,
@@ -34,7 +37,7 @@ const missing = missingRequiredEnv(process.env);
 if (missing.length > 0) {
   throw new Error(
     `tdai-memory: missing required env var(s): ${missing.join(", ")}. ` +
-    "Set them (see README) and restart pi.",
+      "Set them (see README) and restart pi.",
   );
 }
 const API_KEY = process.env.TDAI_API_KEY as string;
@@ -49,7 +52,9 @@ const TIMEOUT_MS = 60_000; // first request per serviceId can cold-start a store
 // ── Behavior (L2/L3 injection + L0 capture) — both on by default; kill switches below
 const INJECT_ENABLED = process.env.TDAI_INJECT !== "0";
 const CAPTURE_ENABLED = process.env.TDAI_CAPTURE !== "0";
-const INJECT_BUDGET_CHARS = Number(process.env.TDAI_INJECT_MAX_CHARS ?? DEFAULT_BUDGET_CHARS);
+const INJECT_BUDGET_CHARS = Number(
+  process.env.TDAI_INJECT_MAX_CHARS ?? DEFAULT_BUDGET_CHARS,
+);
 
 function scenarioMap(): Record<string, string[]> | undefined {
   const raw = process.env.TDAI_SCENARIO_MAP;
@@ -93,23 +98,38 @@ async function call(
         `tdai ${path}: timed out after ${TIMEOUT_MS / 1000}s — the first request per service id can cold-start a store; retry.`,
       );
     }
-    throw new Error(`tdai ${path}: request failed — ${e?.message} (is the memory gateway reachable?)`);
+    throw new Error(
+      `tdai ${path}: request failed — ${e?.message} (is the memory gateway reachable?)`,
+    );
   }
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(lockHint(`tdai ${path} HTTP ${res.status}: ${text.slice(0, 500)}`));
+    throw new Error(
+      lockHint(`tdai ${path} HTTP ${res.status}: ${text.slice(0, 500)}`),
+    );
   }
 
-  let env: { code?: number; message?: string; request_id?: string; data?: unknown };
+  let env: {
+    code?: number;
+    message?: string;
+    request_id?: string;
+    data?: unknown;
+  };
   try {
     env = (await res.json()) as typeof env;
   } catch (err) {
-    throw new Error(`tdai ${path}: response is not valid JSON: ${(err as Error).message}`);
+    throw new Error(
+      `tdai ${path}: response is not valid JSON: ${(err as Error).message}`,
+    );
   }
   if (env === null || typeof env !== "object") env = {}; // literal null / scalar body
   if (env.code !== undefined && env.code !== 0) {
-    throw new Error(lockHint(`tdai ${path} error ${env.code}: ${env.message} (${env.request_id})`));
+    throw new Error(
+      lockHint(
+        `tdai ${path} error ${env.code}: ${env.message} (${env.request_id})`,
+      ),
+    );
   }
   // "data" in env distinguishes a missing key from an explicit data:null —
   // the latter is a legitimate empty result, not the envelope.
@@ -119,7 +139,8 @@ async function call(
 // ponytail: naive "lock" substring heuristic — the knowledge API has no dedicated
 // lock error code today. Replace with a code-based check if one is introduced.
 function lockHint(msg: string): string {
-  if (/lock/i.test(msg)) return `${msg} — page may be locked by a concurrent write; retry`;
+  if (/lock/i.test(msg))
+    return `${msg} — page may be locked by a concurrent write; retry`;
   return msg;
 }
 
@@ -150,7 +171,13 @@ async function buildMemoryBlock(cwd: string): Promise<string> {
   // L3 core persona (fail-open: absence -> null).
   let core: string | null = null;
   try {
-    const r = (await call(GATEWAY_URL, "TDAI_GATEWAY_URL", "/v3/core/read", idFields(), true)) as { content?: unknown };
+    const r = (await call(
+      GATEWAY_URL,
+      "TDAI_GATEWAY_URL",
+      "/v3/core/read",
+      idFields(),
+      true,
+    )) as { content?: unknown };
     if (typeof r?.content === "string") core = r.content;
   } catch {
     /* no L3 */
@@ -159,7 +186,13 @@ async function buildMemoryBlock(cwd: string): Promise<string> {
   // L2 scenario list -> select paths for this cwd -> read each.
   let entries: ScenarioEntry[] = [];
   try {
-    const r = (await call(GATEWAY_URL, "TDAI_GATEWAY_URL", "/v3/scenario/ls", { ...idFields(), path_prefix: "" }, true)) as {
+    const r = (await call(
+      GATEWAY_URL,
+      "TDAI_GATEWAY_URL",
+      "/v3/scenario/ls",
+      { ...idFields(), path_prefix: "" },
+      true,
+    )) as {
       entries?: ScenarioEntry[];
     };
     entries = (r?.entries ?? [])
@@ -170,9 +203,16 @@ async function buildMemoryBlock(cwd: string): Promise<string> {
   }
 
   const selected = selectScenarioPaths(entries, cwd, scenarioMap());
-  const scenarios = selected.map((p) => ({ path: p, summary: entries.find((e) => e.path === p)?.summary }));
+  const scenarios = selected.map((p) => ({
+    path: p,
+    summary: entries.find((e) => e.path === p)?.summary,
+  }));
 
-  return assembleMemoryBlock({ core, scenarios, budgetChars: INJECT_BUDGET_CHARS });
+  return assembleMemoryBlock({
+    core,
+    scenarios,
+    budgetChars: INJECT_BUDGET_CHARS,
+  });
 }
 
 // ── L0 capture (session_shutdown) ───────────────────────────────────────────
@@ -181,34 +221,51 @@ const CAPTURE_TYPE = "tdai-capture";
 function lastCapturedEntryId(ctx: ExtensionContext): string | null {
   const entries = ctx.sessionManager.getEntries();
   for (let i = entries.length - 1; i >= 0; i--) {
-    const e = entries[i] as { type: string; customType?: string; data?: { lastEntryId?: string } };
-    if (e.type === "custom" && e.customType === CAPTURE_TYPE) return e.data?.lastEntryId ?? null;
+    const e = entries[i] as {
+      type: string;
+      customType?: string;
+      data?: { lastEntryId?: string };
+    };
+    if (e.type === "custom" && e.customType === CAPTURE_TYPE)
+      return e.data?.lastEntryId ?? null;
   }
   return null;
 }
 
-async function captureSession(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
+async function captureSession(
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+): Promise<void> {
   const entries = ctx.sessionManager.getEntries();
   const lastId = lastCapturedEntryId(ctx);
   const lastIdx = lastId ? entries.findIndex((e) => e.id === lastId) : -1;
   const fresh = lastIdx === -1 ? entries : entries.slice(lastIdx + 1);
   if (fresh.length === 0) return;
 
-  const messages = normalizeEntries(fresh as Parameters<typeof normalizeEntries>[0]);
+  const messages = normalizeEntries(
+    fresh as Parameters<typeof normalizeEntries>[0],
+  );
   for (const batch of splitBatches(messages)) {
     if (batch.length > 0) {
       await call(
         GATEWAY_URL,
         "TDAI_GATEWAY_URL",
         "/v3/conversation/add",
-        { ...idFields(), session_id: ctx.sessionManager.getSessionId(), messages: batch },
+        {
+          ...idFields(),
+          session_id: ctx.sessionManager.getSessionId(),
+          messages: batch,
+        },
         true,
       );
     }
   }
 
   // Record how far we've captured so a later shutdown doesn't blindly re-send.
-  pi.appendEntry(CAPTURE_TYPE, { lastEntryId: fresh[fresh.length - 1].id, ts: Date.now() });
+  pi.appendEntry(CAPTURE_TYPE, {
+    lastEntryId: fresh[fresh.length - 1].id,
+    ts: Date.now(),
+  });
 }
 
 // ── Extension ───────────────────────────────────────────────────────────────
@@ -226,15 +283,30 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI) {
     ],
     parameters: Type.Object({
       query: Type.String({ description: "Search query" }),
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Max results (default 5, max 100)" })),
-      type: Type.Optional(Type.String({ description: "Filter by type: episodic | persona | instruction" })),
+      limit: Type.Optional(
+        Type.Integer({
+          minimum: 1,
+          maximum: 100,
+          description: "Max results (default 5, max 100)",
+        }),
+      ),
+      type: Type.Optional(
+        Type.String({
+          description: "Filter by type: episodic | persona | instruction",
+        }),
+      ),
     }),
     async execute(_id, params) {
       const data = await call(
         GATEWAY_URL,
         "TDAI_GATEWAY_URL",
         "/v3/atomic/search",
-        { ...idFields(), query: params.query, limit: clampLimit(params.limit, 5), ...(params.type ? { type: params.type } : {}) },
+        {
+          ...idFields(),
+          query: params.query,
+          limit: clampLimit(params.limit, 5),
+          ...(params.type ? { type: params.type } : {}),
+        },
         true,
       );
       return result(data);
@@ -249,16 +321,33 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI) {
       "List TencentDB (tdai-memory) L1 memory notes (newest first) with pagination.",
     promptSnippet: "List TencentDB memory notes",
     parameters: Type.Object({
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Max results (default 20, max 100)" })),
-      offset: Type.Optional(Type.Integer({ minimum: 0, description: "Offset (default 0)" })),
-      type: Type.Optional(Type.String({ description: "Filter by type: episodic | persona | instruction" })),
+      limit: Type.Optional(
+        Type.Integer({
+          minimum: 1,
+          maximum: 100,
+          description: "Max results (default 20, max 100)",
+        }),
+      ),
+      offset: Type.Optional(
+        Type.Integer({ minimum: 0, description: "Offset (default 0)" }),
+      ),
+      type: Type.Optional(
+        Type.String({
+          description: "Filter by type: episodic | persona | instruction",
+        }),
+      ),
     }),
     async execute(_id, params) {
       const data = await call(
         GATEWAY_URL,
         "TDAI_GATEWAY_URL",
         "/v3/atomic/query",
-        { ...idFields(), limit: clampLimit(params.limit, 20), offset: clampOffset(params.offset), ...(params.type ? { type: params.type } : {}) },
+        {
+          ...idFields(),
+          limit: clampLimit(params.limit, 20),
+          offset: clampOffset(params.offset),
+          ...(params.type ? { type: params.type } : {}),
+        },
         true,
       );
       return result(data);
@@ -277,7 +366,9 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI) {
     ],
     parameters: Type.Object({
       text: Type.String({ description: "The note to capture" }),
-      session: Type.Optional(Type.String({ description: "Session id (default: pi-<date>)" })),
+      session: Type.Optional(
+        Type.String({ description: "Session id (default: pi-<date>)" }),
+      ),
     }),
     async execute(_id, params) {
       const data = await call(
@@ -288,7 +379,8 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI) {
           ...idFields(),
           // || (not ??): an explicit empty session also falls back to the default.
           // toLocaleDateString("en-CA") = YYYY-MM-DD in the caller's local time.
-          session_id: params.session || `pi-${new Date().toLocaleDateString("en-CA")}`,
+          session_id:
+            params.session || `pi-${new Date().toLocaleDateString("en-CA")}`,
           messages: [{ role: "user", content: params.text }],
         },
         true,
@@ -305,7 +397,13 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI) {
       "List knowledge-base wikis on the tdai-memory knowledge service. Returns wiki_id + name — needed before search/read/write.",
     promptSnippet: "List TencentDB knowledge-base wikis",
     parameters: Type.Object({
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Max results (default 20, max 100)" })),
+      limit: Type.Optional(
+        Type.Integer({
+          minimum: 1,
+          maximum: 100,
+          description: "Max results (default 20, max 100)",
+        }),
+      ),
     }),
     async execute(_id, params) {
       const data = await call(
@@ -329,14 +427,25 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI) {
     parameters: Type.Object({
       wiki_id: Type.String({ description: "Wiki id (from tdai_wiki_list)" }),
       query: Type.String({ description: "Search query" }),
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Max results (default 20, max 100)" })),
+      limit: Type.Optional(
+        Type.Integer({
+          minimum: 1,
+          maximum: 100,
+          description: "Max results (default 20, max 100)",
+        }),
+      ),
     }),
     async execute(_id, params) {
       const data = await call(
         KNOWLEDGE_URL,
         "TDAI_KNOWLEDGE_URL",
         "/v3/wiki/search",
-        { ...idFields(), wiki_id: params.wiki_id, query: params.query, limit: clampLimit(params.limit, 20) },
+        {
+          ...idFields(),
+          wiki_id: params.wiki_id,
+          query: params.query,
+          limit: clampLimit(params.limit, 20),
+        },
         false,
       );
       return result(data);
@@ -351,14 +460,24 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI) {
     promptSnippet: "List pages in a TencentDB wiki",
     parameters: Type.Object({
       wiki_id: Type.String({ description: "Wiki id (from tdai_wiki_list)" }),
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Max results (default 20, max 100)" })),
+      limit: Type.Optional(
+        Type.Integer({
+          minimum: 1,
+          maximum: 100,
+          description: "Max results (default 20, max 100)",
+        }),
+      ),
     }),
     async execute(_id, params) {
       const data = await call(
         KNOWLEDGE_URL,
         "TDAI_KNOWLEDGE_URL",
         "/v3/wiki/page/ls",
-        { ...idFields(), wiki_id: params.wiki_id, limit: clampLimit(params.limit, 20) },
+        {
+          ...idFields(),
+          wiki_id: params.wiki_id,
+          limit: clampLimit(params.limit, 20),
+        },
         false,
       );
       return result(data);
@@ -374,11 +493,15 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI) {
     promptSnippet: "Read pages from a TencentDB wiki",
     parameters: Type.Object({
       wiki_id: Type.String({ description: "Wiki id (from tdai_wiki_list)" }),
-      refs: Type.Array(Type.String(), { description: "Page refs to read (max 20)" }),
+      refs: Type.Array(Type.String(), {
+        description: "Page refs to read (max 20)",
+      }),
     }),
     async execute(_id, params) {
       if (params.refs.length > 20) {
-        throw new Error(`tdai_wiki_read: ${params.refs.length} refs given, max is 20 — split into multiple calls`);
+        throw new Error(
+          `tdai_wiki_read: ${params.refs.length} refs given, max is 20 — split into multiple calls`,
+        );
       }
       const data = await call(
         KNOWLEDGE_URL,
@@ -410,7 +533,9 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI) {
     }),
     async execute(_id, params) {
       if (params.pages.length > 20) {
-        throw new Error(`tdai_wiki_write: ${params.pages.length} pages given, max is 20 — split into multiple calls`);
+        throw new Error(
+          `tdai_wiki_write: ${params.pages.length} pages given, max is 20 — split into multiple calls`,
+        );
       }
       const data = await call(
         KNOWLEDGE_URL,
