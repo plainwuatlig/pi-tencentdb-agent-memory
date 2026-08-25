@@ -1,7 +1,7 @@
 {
   "name": "@plainwuatlig/pi-tencentdb-agent-memory",
-  "version": "0.2.0",
-  "description": "TencentDB Agent Memory (tdai) for pi: 8 memory/knowledge tools + automatic L0 conversation capture + budgeted L2/L3 prompt injection.",
+  "version": "0.3.0",
+  "description": "TencentDB Agent Memory (tdai) for pi: 8 memory/knowledge tools + automatic L0 conversation capture + visible L2/L3 (once per session) and L1 (every turn, deduped) memory injection as a reviewable transcript message.",
   "type": "module",
   "license": "MIT",
   "author": "Plain Wu",

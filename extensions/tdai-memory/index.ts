@@ -26,8 +26,13 @@ import {
   normalizeEntries,
   splitBatches,
   missingRequiredEnv,
+  isKillSwitchOff,
+  atomicHitsFrom,
+  atomicFingerprint,
+  sameFingerprint,
   DEFAULT_BUDGET_CHARS,
   type ScenarioEntry,
+  type AtomicHit,
 } from "./lib.js";
 
 // ── Config (fail-fast: every external var is required, no silent defaults) ──
@@ -48,13 +53,24 @@ const TEAM_ID = process.env.TDAI_TEAM_ID as string;
 const USER_ID = process.env.TDAI_USER_ID as string;
 const AGENT_ID = process.env.TDAI_AGENT_ID as string;
 const TIMEOUT_MS = 60_000; // first request per serviceId can cold-start a store
+// The per-turn atomic push (below) is AUTOMATIC — the model never asked for it —
+// unlike every other call in this file, which a tool call or an explicit turn start
+// triggers. Reusing TIMEOUT_MS here would mean a hung (not merely refused) gateway
+// adds up to 60s to EVERY ordinary turn. Tight on purpose: one vector lookup has no
+// business taking longer than this, and a slow answer is worse than a skipped one.
+const AUTO_ATOMIC_TIMEOUT_MS = 5_000;
 
-// ── Behavior (L2/L3 injection + L0 capture) — both on by default; kill switches below
-const INJECT_ENABLED = process.env.TDAI_INJECT !== "0";
-const CAPTURE_ENABLED = process.env.TDAI_CAPTURE !== "0";
+// ── Behavior (L2/L3 + L1 injection + L0 capture) — all on by default; kill switches below
+const INJECT_ENABLED = !isKillSwitchOff(process.env.TDAI_INJECT);
+const CAPTURE_ENABLED = !isKillSwitchOff(process.env.TDAI_CAPTURE);
 const INJECT_BUDGET_CHARS = Number(
   process.env.TDAI_INJECT_MAX_CHARS ?? DEFAULT_BUDGET_CHARS,
 );
+// Top-N atoms searched with the incoming prompt on EVERY turn — same number ADLC's
+// own per-turn recall settled on (spec 18), for the same reason: fewer than a
+// once-per-session push needs, since this repeats every turn rather than once per
+// kernel/session life.
+const ATOMIC_LIMIT = 3;
 
 function scenarioMap(): Record<string, string[]> | undefined {
   const raw = process.env.TDAI_SCENARIO_MAP;
@@ -73,6 +89,7 @@ async function call(
   path: string,
   body: Record<string, unknown>,
   withAuth: boolean,
+  timeoutMs: number = TIMEOUT_MS,
 ): Promise<unknown> {
   if (!baseUrl) {
     throw new Error(`tdai ${path}: base URL not set (set ${urlEnvVar})`);
@@ -89,13 +106,13 @@ async function call(
       method: "POST",
       headers,
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (err) {
     const e = err as Error & { name?: string };
     if (e?.name === "TimeoutError" || e?.name === "AbortError") {
       throw new Error(
-        `tdai ${path}: timed out after ${TIMEOUT_MS / 1000}s — the first request per service id can cold-start a store; retry.`,
+        `tdai ${path}: timed out after ${timeoutMs / 1000}s — the first request per service id can cold-start a store; retry.`,
       );
     }
     throw new Error(
@@ -166,10 +183,28 @@ const result = (data: unknown) => ({
   details: {},
 });
 
-// ── L2/L3 injection (before_agent_start) ────────────────────────────────────
-async function buildMemoryBlock(cwd: string): Promise<string> {
+// Bounds the two once-per-session calls below — automatic (the model never asked
+// for them), same reasoning as AUTO_ATOMIC_TIMEOUT_MS. A hung gateway must not stall
+// the FIRST reply of a session by up to 120s (2 sequential calls at the old 60s
+// default) — worse still now that a genuine outage retries every turn (see `ok`
+// below), which without a tight bound would mean repeatedly stalling every turn.
+const AUTO_SESSION_TIMEOUT_MS = 8_000;
+
+// ── L2/L3 injection (before_agent_start, once per session) ──────────────────
+/**
+ * `ok` distinguishes "genuinely nothing to inject" from "could not reach tdai" —
+ * found by review: `buildMemoryBlock` used to swallow both cases identically
+ * (empty core, empty scenarios), so the caller had no way to tell a real outage
+ * from an empty-but-healthy memory, and latched `sessionOpened = true` either way.
+ * One transient hiccup at the exact moment of a session's FIRST prompt meant no
+ * persona for the rest of that session's life, silently. `ok` is true unless BOTH
+ * calls threw — mirrors ADLC's own spec-15 recall push ("not (persona.ok or
+ * scenarios.ok)" — a total outage, not a partial one, is what actually blocks).
+ */
+async function buildMemoryBlock(cwd: string): Promise<{ block: string; ok: boolean }> {
   // L3 core persona (fail-open: absence -> null).
   let core: string | null = null;
+  let coreOk = false;
   try {
     const r = (await call(
       GATEWAY_URL,
@@ -177,14 +212,17 @@ async function buildMemoryBlock(cwd: string): Promise<string> {
       "/v3/core/read",
       idFields(),
       true,
+      AUTO_SESSION_TIMEOUT_MS,
     )) as { content?: unknown };
     if (typeof r?.content === "string") core = r.content;
+    coreOk = true;
   } catch {
     /* no L3 */
   }
 
   // L2 scenario list -> select paths for this cwd -> read each.
   let entries: ScenarioEntry[] = [];
+  let scenariosOk = false;
   try {
     const r = (await call(
       GATEWAY_URL,
@@ -192,12 +230,14 @@ async function buildMemoryBlock(cwd: string): Promise<string> {
       "/v3/scenario/ls",
       { ...idFields(), path_prefix: "" },
       true,
+      AUTO_SESSION_TIMEOUT_MS,
     )) as {
       entries?: ScenarioEntry[];
     };
     entries = (r?.entries ?? [])
       .filter((e): e is ScenarioEntry => typeof e?.path === "string")
       .map((e) => ({ path: e.path, summary: e.summary }));
+    scenariosOk = true;
   } catch {
     /* no L2 */
   }
@@ -208,9 +248,73 @@ async function buildMemoryBlock(cwd: string): Promise<string> {
     summary: entries.find((e) => e.path === p)?.summary,
   }));
 
+  return {
+    block: assembleMemoryBlock({ core, scenarios, budgetChars: INJECT_BUDGET_CHARS }),
+    ok: coreOk || scenariosOk,
+  };
+}
+
+// ── L1 per-turn injection (before_agent_start, every turn) ──────────────────
+// Module-level, on purpose: one Node process = one pi session's worth of "kernel
+// life" (same distinction ADLC's own coordinators.py draws) — a fresh process
+// naturally starts with no fingerprint to dedupe against and no full-block sent yet,
+// no explicit reset needed. `session_start` below resets both anyway for the
+// mid-process case (/resume, /fork, /new): a different conversation must not be
+// judged against the PREVIOUS one's last atoms, and deserves its own full push.
+let sessionOpened = false;
+let lastAtomicFingerprint: string[] | null = null;
+
+// Caps the query sent to /v3/atomic/search — found by review: `event.prompt` handed
+// straight through was UNBOUNDED, so a 200,000-char prompt posted 200,000 chars every
+// turn. Every other boundary in this file is capped (MAX_MSG_CHARS 8192, refs/pages
+// limits); a search query needs far less than that to be useful, and a very long
+// query is not obviously BETTER for a vector/BM25 backend than a capped one.
+const ATOMIC_QUERY_MAX_CHARS = 2000;
+
+/**
+ * The proxy-mimic per-turn push (mirrors ADLC spec 18): search THIS TURN's own
+ * incoming prompt text against L1 atoms, top `ATOMIC_LIMIT`, rendered via the same
+ * `assembleMemoryBlock` the full L2/L3 push uses. Landing in a visible session
+ * MESSAGE (see the `before_agent_start` handler below), not spliced into the system
+ * prompt — the whole point of this refactor: every injection is a reviewable row in
+ * the transcript, not invisible context the model silently receives.
+ *
+ * Skipped (returns "") when this turn's hits are IDENTICAL to the previous turn's —
+ * a topic that persists across turns must not silt the transcript with the same
+ * three atoms every single time. An outage is NEVER deduped against a prior outage
+ * (`lastAtomicFingerprint` is reset to null on failure) — unlike ADLC's own harness,
+ * this returns the failure VISIBLY inline rather than a separate marker constant,
+ * since this file has no equivalent of `tdai.unavailable_marker` to reuse.
+ */
+async function buildTurnAtomicBlock(query: string): Promise<string> {
+  const trimmed = query.trim().slice(0, ATOMIC_QUERY_MAX_CHARS);
+  if (!trimmed) return "";
+  let hits: AtomicHit[];
+  try {
+    const data = await call(
+      GATEWAY_URL,
+      "TDAI_GATEWAY_URL",
+      "/v3/atomic/search",
+      { ...idFields(), query: trimmed, limit: ATOMIC_LIMIT },
+      true,
+      AUTO_ATOMIC_TIMEOUT_MS,
+    );
+    hits = atomicHitsFrom(data);
+  } catch (err) {
+    lastAtomicFingerprint = null; // an outage is never "the same as last turn"
+    return `<tdai-memory-unavailable>\n${(err as Error).message}\n</tdai-memory-unavailable>`;
+  }
+  const fp = atomicFingerprint(hits);
+  if (sameFingerprint(lastAtomicFingerprint, fp)) return "";
+  lastAtomicFingerprint = fp;
+  if (fp.length === 0) return "";
+  // budgetChars explicit: found by review — omitting it here silently fell back to
+  // lib.ts's own DEFAULT_BUDGET_CHARS (16000) instead of honoring TDAI_INJECT_MAX_CHARS,
+  // harmless only by coincidence (3 hits × 200 chars is nowhere near either budget).
   return assembleMemoryBlock({
-    core,
-    scenarios,
+    core: null,
+    scenarios: [],
+    atomicHits: hits,
     budgetChars: INJECT_BUDGET_CHARS,
   });
 }
@@ -552,17 +656,74 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI) {
     },
   });
 
-  // ── Behavior: L2/L3 injection + L0 capture (fail-open) ───────────────────
+  // ── Behavior: L2/L3 (once per session) + L1 (every turn) injection, visible ─
   if (INJECT_ENABLED) {
+    // A fresh session — /new, /resume, /fork, or a brand-new process — starts its
+    // own full push and must not be judged against the PREVIOUS session's last
+    // atoms. `before_agent_start` always fires after this on the first turn (see
+    // the framework's own lifecycle: session_start precedes every prompt), so
+    // resetting here is enough; no ordering race with the read below.
+    pi.on("session_start", () => {
+      sessionOpened = false;
+      lastAtomicFingerprint = null;
+    });
+
+    // Compaction can summarize away the injected message just like any other
+    // conversation entry (session_compact treats custom messages as an ordinary cut
+    // point) — found by review: the OLD design (spliced into systemPrompt, rebuilt
+    // fresh every turn) was structurally immune to this; moving delivery to a
+    // visible message reopened it. Re-arming here means the NEXT turn after a
+    // compaction gets the full persona back, rather than it being gone for the rest
+    // of the process life.
+    pi.on("session_compact", () => {
+      sessionOpened = false;
+    });
+
     pi.on("before_agent_start", async (event) => {
-      try {
-        const cwd = event.systemPromptOptions?.cwd ?? process.cwd();
-        const block = await buildMemoryBlock(cwd);
-        if (!block) return;
-        return { systemPrompt: `${event.systemPrompt}\n\n${block}` };
-      } catch {
-        return; // fail-open: a memory outage must never block the agent
+      const parts: string[] = [];
+
+      // The full L2/L3 push, ONCE per session — not every turn. Found in this
+      // refactor, not merely inherited: once injection becomes a VISIBLE message
+      // (below) rather than an invisible system-prompt splice, repeating a mostly-
+      // static persona+scenario block on every single turn would be transcript
+      // clutter, not context. Each half stays independently fail-open, same as
+      // buildMemoryBlock's own internal per-call try/catch.
+      //
+      // The latch (`sessionOpened = true`) is set ONLY when `ok` — found by review:
+      // setting it unconditionally meant a single transient hiccup at the exact
+      // moment of a session's FIRST prompt silently lost the persona for that
+      // session's entire life, because `buildMemoryBlock` is internally fail-open
+      // and never actually throws, so the outer catch never had a chance to leave
+      // `sessionOpened` false for a retry. Left false, the very next turn retries.
+      if (!sessionOpened) {
+        try {
+          const cwd = event.systemPromptOptions?.cwd ?? process.cwd();
+          const { block, ok } = await buildMemoryBlock(cwd);
+          if (block) parts.push(block);
+          if (ok) sessionOpened = true;
+        } catch {
+          /* fail-open: a memory outage must never block the agent; sessionOpened
+             stays false so the next turn retries */
+        }
       }
+
+      // The per-turn L1 push — every turn, this turn's own incoming text.
+      try {
+        const turnBlock = await buildTurnAtomicBlock(event.prompt ?? "");
+        if (turnBlock) parts.push(turnBlock);
+      } catch {
+        /* fail-open: buildTurnAtomicBlock itself is fail-open internally, but
+           nothing outside this file guarantees it always will be */
+      }
+
+      if (parts.length === 0) return;
+      return {
+        message: {
+          customType: "tdai-memory-inject",
+          content: parts.join("\n\n"),
+          display: true,
+        },
+      };
     });
   }
 

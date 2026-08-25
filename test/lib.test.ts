@@ -6,9 +6,14 @@ import {
   assembleMemoryBlock,
   normalizeEntries,
   missingRequiredEnv,
+  isKillSwitchOff,
+  atomicHitsFrom,
+  atomicFingerprint,
+  sameFingerprint,
   REQUIRED_ENV,
   MAX_MSG_CHARS,
   MAX_MSGS_PER_POST,
+  ATOMIC_SUMMARY_MAX,
   type L0Message,
   type SessionEntryLike,
 } from "../extensions/tdai-memory/lib.js";
@@ -137,6 +142,126 @@ test("assembleMemoryBlock: truncates L2 summaries to 200 chars", () => {
   const block = assembleMemoryBlock({ core: null, scenarios: [{ path: "p.md", summary: "y".repeat(500) }] });
   expect(block).toContain("y".repeat(200));
   expect(block).not.toContain("y".repeat(201));
+});
+
+test("assembleMemoryBlock: atomic hits alone -> a Recent Memories section", () => {
+  const block = assembleMemoryBlock({
+    core: null,
+    scenarios: [],
+    atomicHits: [{ content: "vouchers ship in farm2" }],
+  });
+  expect(block).toContain("### Recent Memories");
+  expect(block).toContain("vouchers ship in farm2");
+});
+
+test("assembleMemoryBlock: section order is Core, Scenarios, then Recent Memories", () => {
+  const block = assembleMemoryBlock({
+    core: "CORE_MARKER",
+    scenarios: [{ path: "s.md", summary: "SCENE_MARKER" }],
+    atomicHits: [{ content: "ATOM_MARKER" }],
+  });
+  expect(block.indexOf("CORE_MARKER")).toBeLessThan(block.indexOf("SCENE_MARKER"));
+  expect(block.indexOf("SCENE_MARKER")).toBeLessThan(block.indexOf("ATOM_MARKER"));
+});
+
+test("assembleMemoryBlock: atomic hits fall back to the text key", () => {
+  const block = assembleMemoryBlock({ core: null, scenarios: [], atomicHits: [{ text: "fallback fact" }] });
+  expect(block).toContain("fallback fact");
+});
+
+test("assembleMemoryBlock: an atom with neither content nor text contributes no empty bullet", () => {
+  const block = assembleMemoryBlock({ core: null, scenarios: [], atomicHits: [{}] });
+  expect(block).toBe(""); // nothing anywhere else either -> nothing at all
+});
+
+test("assembleMemoryBlock: atomic hit content truncated to ATOMIC_SUMMARY_MAX chars", () => {
+  expect(ATOMIC_SUMMARY_MAX).toBe(200);
+  const block = assembleMemoryBlock({ core: null, scenarios: [], atomicHits: [{ content: "y".repeat(500) }] });
+  expect(block).toContain("y".repeat(200));
+  expect(block).not.toContain("y".repeat(201));
+});
+
+test("assembleMemoryBlock: drops atomic hits that exceed the budget", () => {
+  const atomicHits = Array.from({ length: 8 }, (_, i) => ({ content: `atom${i}-` + "x".repeat(60) }));
+  const block = assembleMemoryBlock({ core: "core", scenarios: [], atomicHits, budgetChars: 400 });
+  expect(block.length).toBeLessThanOrEqual(400);
+  expect(block).toContain("atom0-");
+  expect(block).not.toContain("atom7-"); // later ones dropped, same discipline as scenarios
+});
+
+test("assembleMemoryBlock: omitting atomicHits entirely behaves exactly as before (no regression)", () => {
+  const block = assembleMemoryBlock({ core: "persona", scenarios: [{ path: "s.md" }] });
+  expect(block).not.toContain("Recent Memories");
+});
+
+// ── atomicHitsFrom ───────────────────────────────────────────────────────────
+test("atomicHitsFrom: reads the observed key and the defended ones", () => {
+  const hits = [{ content: "a fact" }];
+  expect(atomicHitsFrom({ results: hits })).toEqual(hits);
+  expect(atomicHitsFrom({ memories: hits })).toEqual(hits);
+  expect(atomicHitsFrom({ list: hits })).toEqual(hits);
+  expect(atomicHitsFrom({ entries: hits })).toEqual(hits);
+  expect(atomicHitsFrom(hits)).toEqual(hits); // a bare array
+});
+
+test("atomicHitsFrom: anything unrecognizable is no hits, never a throw", () => {
+  expect(atomicHitsFrom(null)).toEqual([]);
+  expect(atomicHitsFrom(undefined)).toEqual([]);
+  expect(atomicHitsFrom({ unrelated: 1 })).toEqual([]);
+  expect(atomicHitsFrom(["not", "objects"])).toEqual([]);
+  expect(atomicHitsFrom("a string")).toEqual([]);
+});
+
+// ── atomicFingerprint / sameFingerprint ──────────────────────────────────────
+test("atomicFingerprint: sorted content strings, blanks dropped", () => {
+  expect(atomicFingerprint([{ content: "b" }, { content: "a" }, { content: "  " }])).toEqual(["a", "b"]);
+});
+
+test("atomicFingerprint: order of the input hits does not change the fingerprint", () => {
+  const fp1 = atomicFingerprint([{ content: "x" }, { content: "y" }]);
+  const fp2 = atomicFingerprint([{ content: "y" }, { content: "x" }]);
+  expect(fp1).toEqual(fp2);
+});
+
+test("sameFingerprint: null previous never matches, even an empty current", () => {
+  expect(sameFingerprint(null, [])).toBe(false);
+});
+
+test("sameFingerprint: equal arrays match, different ones don't", () => {
+  expect(sameFingerprint(["a", "b"], ["a", "b"])).toBe(true);
+  expect(sameFingerprint(["a", "b"], ["a", "c"])).toBe(false);
+  expect(sameFingerprint(["a"], ["a", "b"])).toBe(false);
+});
+
+test("atomicFingerprint: matches what actually renders — hits differing only past ATOMIC_SUMMARY_MAX fingerprint identically", () => {
+  // Found by review: fingerprinting the FULL text while rendering a TRUNCATED line
+  // meant two hits differing only past char 200 got DIFFERENT fingerprints but
+  // byte-identical rendered output, defeating the dedup on exactly the case it
+  // exists to catch.
+  const hitA = { content: "x".repeat(200) + "AAAA" };
+  const hitB = { content: "x".repeat(200) + "BBBB" };
+  const fpA = atomicFingerprint([hitA]);
+  const fpB = atomicFingerprint([hitB]);
+  expect(fpA).toEqual(fpB);
+  // and the rendered block really is identical, proving the fingerprints were
+  // right to treat them as the same turn's hits
+  const blockA = assembleMemoryBlock({ core: null, scenarios: [], atomicHits: [hitA] });
+  const blockB = assembleMemoryBlock({ core: null, scenarios: [], atomicHits: [hitB] });
+  expect(blockA).toBe(blockB);
+});
+
+// ── isKillSwitchOff ──────────────────────────────────────────────────────────
+test("isKillSwitchOff: both documented and legacy spellings disable", () => {
+  expect(isKillSwitchOff("off")).toBe(true);
+  expect(isKillSwitchOff("OFF")).toBe(true);
+  expect(isKillSwitchOff("0")).toBe(true);
+});
+
+test("isKillSwitchOff: unset, on, or anything else means enabled", () => {
+  expect(isKillSwitchOff(undefined)).toBe(false);
+  expect(isKillSwitchOff("")).toBe(false);
+  expect(isKillSwitchOff("on")).toBe(false);
+  expect(isKillSwitchOff("1")).toBe(false);
 });
 
 // ── normalizeEntries ─────────────────────────────────────────────────────────

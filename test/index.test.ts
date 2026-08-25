@@ -276,20 +276,298 @@ test("#15 non-lock errors are unchanged", async () => {
   }
 });
 
-test("before_agent_start injects core + scenario into the system prompt", async () => {
+// ── before_agent_start: visible injection, once-per-session L2/L3 + per-turn L1 ──
+// Module state (sessionOpened, lastAtomicFingerprint) persists across tests in this
+// file — every test below starts by firing session_start to get a clean slate,
+// exactly the reset a real /new or /resume would trigger.
+function freshSession(handlers: ReturnType<typeof makePi>["handlers"]) {
+  handlers.session_start[0]({}, {
+    ui: { setStatus: () => {}, theme: { fg: (_: string, s: string) => s } },
+  });
+}
+
+test("first turn of a session injects core + scenario as a VISIBLE message, not the system prompt", async () => {
   const { pi, handlers } = makePi();
   extension(pi);
+  freshSession(handlers);
   const h = handlers.before_agent_start[0];
   const res = (await h(
     { systemPrompt: "BASE PROMPT", systemPromptOptions: { cwd: "/test/cwd" } },
     {},
-  )) as {
-    systemPrompt: string;
-  };
-  expect(res.systemPrompt).toContain("BASE PROMPT");
-  expect(res.systemPrompt).toContain("TEST CORE PERSONA");
-  expect(res.systemPrompt).toContain("proj.md");
-  expect(res.systemPrompt).toContain("proj summary");
+  )) as { systemPrompt?: string; message?: { customType: string; content: string; display: boolean } };
+  expect(res.systemPrompt).toBeUndefined();
+  expect(res.message?.display).toBe(true);
+  expect(res.message?.customType).toBe("tdai-memory-inject");
+  expect(res.message?.content).toContain("TEST CORE PERSONA");
+  expect(res.message?.content).toContain("proj.md");
+  expect(res.message?.content).toContain("proj summary");
+});
+
+test("the SECOND turn of the same session does not repeat the full L2/L3 push", async () => {
+  const { pi, handlers } = makePi();
+  extension(pi);
+  freshSession(handlers);
+  const h = handlers.before_agent_start[0];
+  await h({ systemPrompt: "P", systemPromptOptions: { cwd: "/x" } }, {}); // first turn
+  const res = (await h(
+    { systemPrompt: "P", systemPromptOptions: { cwd: "/x" }, prompt: "" },
+    {},
+  )) as { message?: { content: string } };
+  // second turn: no query text either, so nothing at all to inject
+  expect(res).toBeUndefined();
+});
+
+test("a NEW session (session_start again) gets the full push again", async () => {
+  const { pi, handlers } = makePi();
+  extension(pi);
+  freshSession(handlers);
+  const h = handlers.before_agent_start[0];
+  await h({ systemPrompt: "P", systemPromptOptions: { cwd: "/x" } }, {}); // first session's first turn
+  freshSession(handlers); // /new or /resume
+  const res = (await h(
+    { systemPrompt: "P", systemPromptOptions: { cwd: "/x" } },
+    {},
+  )) as { message?: { content: string } };
+  expect(res.message?.content).toContain("TEST CORE PERSONA");
+});
+
+test("every turn searches L1 atoms with THIS turn's own incoming prompt text", async () => {
+  const { pi, handlers } = makePi();
+  extension(pi);
+  freshSession(handlers);
+  const { seen, restore } = mockFetch(200, {
+    code: 0,
+    data: { results: [{ content: "vouchers ship in farm2" }] },
+  });
+  try {
+    const h = handlers.before_agent_start[0];
+    const res = (await h(
+      { systemPrompt: "P", systemPromptOptions: { cwd: "/x" }, prompt: "what about vouchers?" },
+      {},
+    )) as { message?: { content: string } };
+    // this is the FIRST turn of a fresh session, so core/scenario calls fire first —
+    // find the atomic search call by URL rather than assume its index.
+    const atomicCall = seen.find((c) => c.url.endsWith("/v3/atomic/search"));
+    expect(atomicCall?.body.query).toBe("what about vouchers?");
+    expect(atomicCall?.body.limit).toBe(3);
+    expect(res.message?.content).toContain("vouchers ship in farm2");
+  } finally {
+    restore();
+  }
+});
+
+test("identical atomic hits across consecutive turns are not repeated", async () => {
+  const { pi, handlers } = makePi();
+  extension(pi);
+  freshSession(handlers);
+  const { restore } = mockFetch(200, {
+    code: 0,
+    data: { results: [{ content: "same fact every time" }] },
+  });
+  try {
+    const h = handlers.before_agent_start[0];
+    const first = (await h(
+      { systemPrompt: "P", systemPromptOptions: { cwd: "/x" }, prompt: "q1" },
+      {},
+    )) as { message?: { content: string } };
+    expect(first.message?.content).toContain("same fact every time");
+
+    const second = (await h(
+      { systemPrompt: "P", systemPromptOptions: { cwd: "/x" }, prompt: "q2" },
+      {},
+    )) as { message?: { content: string } | undefined } | undefined;
+    // full L2/L3 already sent on turn one, and the atoms are identical -> nothing left to send
+    expect(second).toBeUndefined();
+  } finally {
+    restore();
+  }
+});
+
+test("changed atomic hits are NOT suppressed on the next turn", async () => {
+  const { pi, handlers } = makePi();
+  extension(pi);
+  freshSession(handlers);
+  const h = handlers.before_agent_start[0];
+
+  // try/finally throughout — found by review: a bare `m.restore()` call after the
+  // assertion left the mock leaked into every LATER test in the file if that
+  // assertion ever threw, since bun does not isolate globalThis.fetch per test.
+  let m = mockFetch(200, { code: 0, data: { results: [{ content: "fact one" }] } });
+  try {
+    const first = (await h(
+      { systemPrompt: "P", systemPromptOptions: { cwd: "/x" }, prompt: "q1" },
+      {},
+    )) as { message?: { content: string } };
+    expect(first.message?.content).toContain("fact one");
+  } finally {
+    m.restore();
+  }
+
+  m = mockFetch(200, { code: 0, data: { results: [{ content: "fact two" }] } });
+  try {
+    const second = (await h(
+      { systemPrompt: "P", systemPromptOptions: { cwd: "/x" }, prompt: "q2" },
+      {},
+    )) as { message?: { content: string } };
+    expect(second.message?.content).toContain("fact two");
+  } finally {
+    m.restore();
+  }
+});
+
+test("an atomic-search outage is a VISIBLE marker, not silently swallowed", async () => {
+  const { pi, handlers } = makePi();
+  extension(pi);
+  freshSession(handlers);
+  const prev = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    throw new TypeError("fetch failed");
+  }) as typeof fetch;
+  try {
+    const h = handlers.before_agent_start[0];
+    const res = (await h(
+      { systemPrompt: "P", systemPromptOptions: { cwd: "/x" }, prompt: "anything" },
+      {},
+    )) as { message?: { content: string } };
+    expect(res.message?.content).toContain("tdai-memory-unavailable");
+    expect(res.message?.content).toContain("reachable");
+  } finally {
+    globalThis.fetch = prev;
+  }
+});
+
+test("a repeated outage marks EVERY turn it actually fails, never deduped against itself", async () => {
+  const { pi, handlers } = makePi();
+  extension(pi);
+  freshSession(handlers);
+  const prev = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    throw new TypeError("fetch failed");
+  }) as typeof fetch;
+  try {
+    const h = handlers.before_agent_start[0];
+    const first = (await h(
+      { systemPrompt: "P", systemPromptOptions: { cwd: "/x" }, prompt: "q1" },
+      {},
+    )) as { message?: { content: string } };
+    const second = (await h(
+      { systemPrompt: "P", systemPromptOptions: { cwd: "/x" }, prompt: "q2" },
+      {},
+    )) as { message?: { content: string } };
+    expect(first.message?.content).toContain("tdai-memory-unavailable");
+    expect(second.message?.content).toContain("tdai-memory-unavailable");
+  } finally {
+    globalThis.fetch = prev;
+  }
+});
+
+test("no hits and no query text -> no message at all, not an empty one", async () => {
+  const { pi, handlers } = makePi();
+  extension(pi);
+  freshSession(handlers);
+  const prev = globalThis.fetch;
+  // Everything empty: no core, no scenarios, no atoms — this is still the FIRST
+  // turn of the session (freshSession reset sessionOpened), so the full push is
+  // attempted; it must yield nothing rather than an empty <tdai-memory></tdai-memory>.
+  globalThis.fetch = (async (url: string) => {
+    const u = String(url);
+    if (u.endsWith("/v3/core/read")) return new Response(JSON.stringify({ code: 0, data: { content: null } }), { status: 200 });
+    if (u.endsWith("/v3/scenario/ls")) return new Response(JSON.stringify({ code: 0, data: { entries: [] } }), { status: 200 });
+    if (u.endsWith("/v3/atomic/search")) return new Response(JSON.stringify({ code: 0, data: { results: [] } }), { status: 200 });
+    return new Response(JSON.stringify({ code: 1, message: "not found" }), { status: 404 });
+  }) as typeof fetch;
+  try {
+    const h = handlers.before_agent_start[0];
+    const res = await h(
+      { systemPrompt: "P", systemPromptOptions: { cwd: "/x" }, prompt: "q" },
+      {},
+    );
+    expect(res).toBeUndefined();
+  } finally {
+    globalThis.fetch = prev;
+  }
+});
+
+test("a first-turn outage does NOT permanently lose the full push — the next turn retries and succeeds", async () => {
+  // Found by review: buildMemoryBlock is internally fail-open (its own core/
+  // scenario try/catches never rethrow), so the OLD code latched sessionOpened
+  // BEFORE the fetch — a single transient hiccup at the exact moment of the
+  // session's first prompt meant no persona for the session's entire life,
+  // silently. The fix only latches when at least one call actually reached tdai.
+  const { pi, handlers } = makePi();
+  extension(pi);
+  freshSession(handlers);
+  const h = handlers.before_agent_start[0];
+  const prev = globalThis.fetch;
+  try {
+    // Turn 1: total outage — both core/read and scenario/ls throw.
+    globalThis.fetch = (async () => {
+      throw new TypeError("fetch failed");
+    }) as typeof fetch;
+    const first = await h(
+      { systemPrompt: "P", systemPromptOptions: { cwd: "/x" } }, // no prompt -> no atomic call
+      {},
+    );
+    expect(first).toBeUndefined(); // both calls failed silently, nothing to inject yet
+
+    // Turn 2: tdai recovers — this must be treated as STILL the first successful turn.
+    globalThis.fetch = (async (url: string) => {
+      const u = String(url);
+      if (u.endsWith("/v3/core/read"))
+        return new Response(JSON.stringify({ code: 0, data: { content: "RECOVERED PERSONA" } }), { status: 200 });
+      if (u.endsWith("/v3/scenario/ls"))
+        return new Response(JSON.stringify({ code: 0, data: { entries: [] } }), { status: 200 });
+      return new Response(JSON.stringify({ code: 1, message: "not found" }), { status: 404 });
+    }) as typeof fetch;
+    const second = (await h(
+      { systemPrompt: "P", systemPromptOptions: { cwd: "/x" } },
+      {},
+    )) as { message?: { content: string } };
+    expect(second.message?.content).toContain("RECOVERED PERSONA");
+  } finally {
+    globalThis.fetch = prev;
+  }
+});
+
+test("session_compact re-arms the full push so persona survives compaction", async () => {
+  const { pi, handlers } = makePi();
+  extension(pi);
+  freshSession(handlers);
+  const h = handlers.before_agent_start[0];
+  await h({ systemPrompt: "P", systemPromptOptions: { cwd: "/x" } }, {}); // consumes the first-turn push
+
+  const second = (await h({ systemPrompt: "P", systemPromptOptions: { cwd: "/x" } }, {})) as
+    | { message?: { content: string } }
+    | undefined;
+  expect(second).toBeUndefined(); // second turn, same session: no repeat, as designed
+
+  handlers.session_compact[0]({}, {}); // the framework summarized the injected message away
+  const third = (await h(
+    { systemPrompt: "P", systemPromptOptions: { cwd: "/x" } },
+    {},
+  )) as { message?: { content: string } };
+  expect(third.message?.content).toContain("TEST CORE PERSONA");
+});
+
+test("the per-turn query sent to atomic search is capped, not the raw prompt verbatim", async () => {
+  const { pi, handlers } = makePi();
+  extension(pi);
+  freshSession(handlers);
+  const { seen, restore } = mockFetch(200, { code: 0, data: { results: [] } });
+  try {
+    const h = handlers.before_agent_start[0];
+    const hugePrompt = "q".repeat(200_000);
+    await h(
+      { systemPrompt: "P", systemPromptOptions: { cwd: "/x" }, prompt: hugePrompt },
+      {},
+    );
+    const atomicCall = seen.find((c) => c.url.endsWith("/v3/atomic/search"));
+    const sentQuery = atomicCall?.body.query as string;
+    expect(sentQuery.length).toBeLessThan(hugePrompt.length);
+    expect(sentQuery.length).toBeLessThanOrEqual(2000);
+  } finally {
+    restore();
+  }
 });
 
 test("session_shutdown captures the session (normalized) and records the marker", async () => {

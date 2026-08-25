@@ -13,10 +13,22 @@ export interface ScenarioEntry {
   path: string;
   summary?: string;
 }
+/** One L1 atomic-search hit. Shape is opaque server-side (never asserted elsewhere in
+ * this file); `content` is the field the ADLC harness's own tdai client (same backend,
+ * same endpoint) found the notes under. */
+export interface AtomicHit {
+  content?: string;
+  text?: string;
+}
 export interface MemoryBlockInput {
   core?: string | null;
   /** L2 scenarios to inject: path + optional summary (proxy-faithful: path + ≤200-char summary, no full body). */
   scenarios: ScenarioEntry[];
+  /** L1 atoms found by searching THIS TURN's own incoming prompt text — the per-turn
+   * proxy-mimic push. Optional: omitted (or empty) turns render no "Recent Memories"
+   * section at all, distinct from a turn whose hits are present but deduped away by
+   * the caller before this is even called. */
+  atomicHits?: AtomicHit[];
   budgetChars?: number;
 }
 export interface L0Message {
@@ -118,9 +130,20 @@ function scenarioLine(s: ScenarioEntry): string {
   return summary ? `- ${s.path}: ${summary}` : `- ${s.path}`;
 }
 
+/** L1 atomic-hit summary cap — same 200-char ceiling as an L2 summary line; atoms are
+ * the memory's own already-distilled notes, not full pages, so a shorter cap than a
+ * wiki page would need is the right size here too. */
+export const ATOMIC_SUMMARY_MAX = 200;
+
+function atomicLine(hit: AtomicHit): string {
+  const text = (hit.content ?? hit.text ?? "").trim().slice(0, ATOMIC_SUMMARY_MAX);
+  return text ? `- ${text}` : "";
+}
+
 /**
  * Assemble the <tdai-memory> prompt block: L3 core (full, truncated to fit) first,
- * then selected L2 scenarios as "path: summary" lines, within budgetChars.
+ * then selected L2 scenarios, then L1 atomic hits (the spec-18-style per-turn push),
+ * as "- text" lines, everything within budgetChars.
  * Returns "" when there is nothing to inject.
  */
 export function assembleMemoryBlock(input: MemoryBlockInput): string {
@@ -130,7 +153,8 @@ export function assembleMemoryBlock(input: MemoryBlockInput): string {
 
   const coreText = stripSceneNav((input.core ?? "").trim());
   const scenes = input.scenarios.filter((s) => s.path);
-  if (!coreText && scenes.length === 0) return "";
+  const atoms = (input.atomicHits ?? []).map(atomicLine).filter(Boolean);
+  if (!coreText && scenes.length === 0 && atoms.length === 0) return "";
 
   // L3 core first, truncated to fit on its own.
   let coreBlock = "";
@@ -140,19 +164,80 @@ export function assembleMemoryBlock(input: MemoryBlockInput): string {
     coreBlock = `### Core\n${allow >= coreText.length ? coreText : coreText.slice(0, allow)}`;
   }
 
-  const render = (lines: string[]) => {
-    const blocks = [...(coreBlock ? [coreBlock] : []), ...(lines.length ? [`### Scenarios\n${lines.join("\n")}`] : [])];
+  const render = (sceneLines: string[], atomicLines: string[]) => {
+    const blocks = [
+      ...(coreBlock ? [coreBlock] : []),
+      ...(sceneLines.length ? [`### Scenarios\n${sceneLines.join("\n")}`] : []),
+      ...(atomicLines.length ? [`### Recent Memories\n${atomicLines.join("\n")}`] : []),
+    ];
     return header + blocks.join("\n\n") + footer;
   };
 
-  // L2 lines, added in order while within budget.
-  const lines: string[] = [];
+  // L2 lines, added in order while within budget. NOTE (found by review): this loop
+  // checks against `render([...sceneLines, line], [])` — as if no atomic section
+  // existed — so scenes always get first claim on the budget and can starve atoms
+  // entirely in a caller that passes BOTH scenarios and atomicHits in one call.
+  // Not reachable today: index.ts's two call sites never combine them (the
+  // once-per-session push sends scenarios only, the per-turn push sends atoms
+  // only) — but this function is shared, and a future caller combining both should
+  // budget them together rather than assume this ordering is fair.
+  const sceneLines: string[] = [];
   for (const s of scenes) {
     const line = scenarioLine(s);
-    if (render([...lines, line]).length <= budget) lines.push(line);
+    if (render([...sceneLines, line], []).length <= budget) sceneLines.push(line);
   }
 
-  return render(lines);
+  // L1 lines, added in order while within budget — scenes already settled above.
+  const atomicLines: string[] = [];
+  for (const a of atoms) {
+    if (render(sceneLines, [...atomicLines, a]).length <= budget) atomicLines.push(a);
+  }
+
+  return render(sceneLines, atomicLines);
+}
+
+/**
+ * Pull the hit list out of an atomic-search response — pure, defensive. The response
+ * shape is opaque here (no schema asserted anywhere in this codebase, since
+ * `tdai_search` the TOOL just forwards raw data to the model); this defends the SAME
+ * keys the ADLC harness's own tdai client found against the identical backend
+ * endpoint (`results` observed live; `memories`/`list` defended the same way;
+ * `entries` added defensively since this extension's OWN `/v3/scenario/ls` uses that
+ * key and the two endpoints could plausibly share a response convention). A bare
+ * array is accepted too. Anything unrecognizable is no hits, never a throw.
+ */
+export function atomicHitsFrom(data: unknown): AtomicHit[] {
+  const isHit = (h: unknown): h is AtomicHit => !!h && typeof h === "object";
+  if (Array.isArray(data)) return data.filter(isHit);
+  if (data && typeof data === "object") {
+    for (const key of ["results", "memories", "list", "entries"] as const) {
+      const v = (data as Record<string, unknown>)[key];
+      if (Array.isArray(v)) return v.filter(isHit);
+    }
+  }
+  return [];
+}
+
+/** The dedup key for this turn's atomic hits — sorted, so a ranking-order change
+ * alone (plausible noise from the search backend) does not defeat the dedup.
+ * Truncated to ATOMIC_SUMMARY_MAX, same as `atomicLine`'s own render cap — found by
+ * review: fingerprinting the FULL text while rendering a TRUNCATED line meant two
+ * hits differing only past char 200 got different fingerprints but byte-identical
+ * rendered output, defeating the dedup on exactly the case it exists to catch. */
+export function atomicFingerprint(hits: AtomicHit[]): string[] {
+  return hits
+    .map((h) => (h.content ?? h.text ?? "").trim().slice(0, ATOMIC_SUMMARY_MAX))
+    .filter(Boolean)
+    .sort();
+}
+
+/** Fingerprint equality — `null` (no previous turn, or the previous turn was an
+ * outage) never matches anything, so the very next turn after either always renders
+ * fresh rather than being spuriously suppressed. */
+export function sameFingerprint(a: string[] | null, b: string[]): boolean {
+  if (a === null) return false;
+  if (a.length !== b.length) return false;
+  return a.every((v, i) => v === b[i]);
 }
 
 /**
@@ -214,4 +299,16 @@ export const REQUIRED_ENV = [
 /** Return the required env vars that are unset/empty in `env`. Empty array = all present. */
 export function missingRequiredEnv(env: Record<string, string | undefined>): string[] {
   return REQUIRED_ENV.filter((k) => !env[k]);
+}
+
+/** Whether a TDAI_INJECT / TDAI_CAPTURE kill-switch value means "disabled" — found by
+ * review: the code used to check ONLY `=== "0"`, while README.md documents `off` as
+ * the value to set. A user following the README's own instructions had the switch
+ * silently do nothing — pre-existing, but this refactor raised the stakes: injection
+ * now costs a visible message plus an extra HTTP call every turn, not an invisible
+ * splice, so a kill switch that does not kill anything matters more than it used to.
+ * Both spellings accepted going forward; case-insensitive. */
+export function isKillSwitchOff(value: string | undefined): boolean {
+  const v = (value ?? "").trim().toLowerCase();
+  return v === "0" || v === "off";
 }
