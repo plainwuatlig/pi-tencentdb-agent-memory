@@ -1,1 +1,3 @@
 node_modules/
+# exported pi session transcripts land here by accident
+pi-session-*.html
