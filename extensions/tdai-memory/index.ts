@@ -72,6 +72,16 @@ const INJECT_BUDGET_CHARS = Number(
 // kernel/session life.
 const ATOMIC_LIMIT = 3;
 
+// ── Knowledge-map injection (advertise CONTENTS, not existence) ─────────────
+// Added 2026-08-30 after a deploy session: the agent ran `find ~` sweeps to locate
+// a repo TWICE — once even AFTER being corrected — because the tool list said the
+// KB exists but nothing said WHAT it holds. Routing is expected-value: an agent
+// that cannot predict a KB hit pattern-matches "locate X" to the filesystem.
+// The map's CONTENT is deliberately NOT in this file — this extension is
+// team-agnostic; the map is an ordinary wiki page the team maintains, named here:
+//   TDAI_INJECT_MAP="<wiki_id>:<page ref>"     (unset -> no map injection)
+const INJECT_MAP = process.env.TDAI_INJECT_MAP ?? "";
+
 function scenarioMap(): Record<string, string[]> | undefined {
   const raw = process.env.TDAI_SCENARIO_MAP;
   if (!raw) return undefined;
@@ -254,6 +264,33 @@ async function buildMemoryBlock(cwd: string): Promise<{ block: string; ok: boole
   };
 }
 
+/** Strip one leading YAML frontmatter block — page/read serves page STATE there
+ * (e.g. the `locked: true` the write path injects), which is not knowledge. */
+function stripFrontmatter(s: string): string {
+  const m = s.match(/^---\n[\s\S]*?\n---\n?/);
+  return m ? s.slice(m[0].length) : s;
+}
+
+/** The knowledge-map push: read the team-maintained map page named by
+ * TDAI_INJECT_MAP and wrap it for injection. "" when unset, unparseable, or the
+ * page is empty — the caller latches on a successful call either way (healthy but
+ * empty is not an outage), and only a throw leaves the latch open for retry. */
+async function buildMapBlock(): Promise<string> {
+  const sep = INJECT_MAP.indexOf(":");
+  if (sep <= 0) return "";
+  const data = (await call(
+    KNOWLEDGE_URL,
+    "TDAI_KNOWLEDGE_URL",
+    "/v3/wiki/page/read",
+    { ...idFields(), wiki_id: INJECT_MAP.slice(0, sep), refs: [INJECT_MAP.slice(sep + 1)] },
+    false,
+    AUTO_SESSION_TIMEOUT_MS,
+  )) as { items?: { content?: string }[] };
+  const content = stripFrontmatter((data?.items?.[0]?.content ?? "").trim()).trim();
+  if (!content) return "";
+  return `<tdai-knowledge-map>\n${content.slice(0, INJECT_BUDGET_CHARS)}\n</tdai-knowledge-map>`;
+}
+
 // ── L1 per-turn injection (before_agent_start, every turn) ──────────────────
 // Module-level, on purpose: one Node process = one pi session's worth of "kernel
 // life" (same distinction ADLC's own coordinators.py draws) — a fresh process
@@ -263,6 +300,10 @@ async function buildMemoryBlock(cwd: string): Promise<{ block: string; ok: boole
 // judged against the PREVIOUS one's last atoms, and deserves its own full push.
 let sessionOpened = false;
 let lastAtomicFingerprint: string[] | null = null;
+// Latched separately from `sessionOpened`: the two pushes hit different services
+// (gateway vs knowledge) and must retry independently — one outage must not force
+// the OTHER block to be re-pushed on every retry turn.
+let mapPushed = false;
 
 // Caps the query sent to /v3/atomic/search — found by review: `event.prompt` handed
 // straight through was UNBOUNDED, so a 200,000-char prompt posted 200,000 chars every
@@ -339,7 +380,8 @@ function lastCapturedEntryId(ctx: ExtensionContext): string | null {
 async function captureSession(
   ctx: ExtensionContext,
   pi: ExtensionAPI,
-): Promise<void> {
+): Promise<void>
+{
   const entries = ctx.sessionManager.getEntries();
   const lastId = lastCapturedEntryId(ctx);
   const lastIdx = lastId ? entries.findIndex((e) => e.id === lastId) : -1;
@@ -349,9 +391,21 @@ async function captureSession(
   const messages = normalizeEntries(
     fresh as Parameters<typeof normalizeEntries>[0],
   );
-  for (const batch of splitBatches(messages)) {
-    if (batch.length > 0) {
-      await call(
+  const batches = splitBatches(messages).filter((b) => b.length > 0);
+  if (batches.length === 0) {
+    // Record how far we've captured so a later shutdown doesn't blindly re-send.
+    pi.appendEntry(CAPTURE_TYPE, {
+      lastEntryId: fresh[fresh.length - 1].id,
+      ts: Date.now(),
+    });
+    return;
+  }
+
+  // Send all batches in parallel — fail-open: if any fail, the marker prevents
+  // re-sending the same entries, and individual failures don't block shutdown.
+  await Promise.all(
+    batches.map((batch) =>
+      call(
         GATEWAY_URL,
         "TDAI_GATEWAY_URL",
         "/v3/conversation/add",
@@ -361,11 +415,15 @@ async function captureSession(
           messages: batch,
         },
         true,
-      );
-    }
-  }
+      ).catch(() => undefined), // individual failure is non-blocking
+    ),
+  );
 
   // Record how far we've captured so a later shutdown doesn't blindly re-send.
+  // The marker must be a SESSION ENTRY id (what lastCapturedEntryId looks up),
+  // not anything from the batches: L0Message rows are chunked copies with no id.
+  // Found 2026-09-06: the previous version read `.id` off the last batch row,
+  // which is always undefined, so every shutdown re-sent the whole session.
   pi.appendEntry(CAPTURE_TYPE, {
     lastEntryId: fresh[fresh.length - 1].id,
     ts: Date.now(),
@@ -380,10 +438,17 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI) {
     label: "TDai Memory Search",
     description:
       "Semantic search over TencentDB (tdai-memory) L1 memory notes. Returns scored notes (content, type, background, timestamps).",
-    promptSnippet: "Search TencentDB memory for relevant notes",
+    promptSnippet:
+      "Search team memory: recent decisions, events, lessons learned",
+    // 2026-08-30, a deploy session: a vague "use when relevant" guideline lost to
+    // the harness's own "Use bash for ls, rg, find" — the agent swept the
+    // filesystem twice to locate a repo the KB maps. A rule survives routing only
+    // when it names the TRIGGER (the task shapes) and the forbidden alternative,
+    // so both halves are stated here.
     promptGuidelines: [
       "Use tdai_search to recall memories, decisions, and context stored in TencentDB (tdai-memory).",
       "L1 note types: episodic / persona / instruction — filter with `type` if needed.",
+      "To locate a repo, host, config, deploy recipe, or team decision: query tdai (tdai_search + tdai_wiki_search) FIRST. A find/ls sweep over the home directory or unrelated projects before a tdai miss is an error; targeted reads of files already in play are fine.",
     ],
     parameters: Type.Object({
       query: Type.String({ description: "Search query" }),
@@ -526,8 +591,13 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI) {
     name: "tdai_wiki_search",
     label: "TDai Wiki Search",
     description:
-      "Full-text (BM25) search inside one TencentDB wiki. Requires wiki_id (from tdai_wiki_list).",
-    promptSnippet: "Full-text search in a TencentDB wiki",
+      "Full-text (BM25) search inside one TencentDB wiki. Requires wiki_id (from tdai_wiki_list). " +
+      "Wikis hold the team's settled knowledge: product docs, architecture, contracts, decisions.",
+    promptSnippet:
+      "Search the team knowledge-base wiki (product docs, architecture, decisions)",
+    promptGuidelines: [
+      "The team KB wiki is where settled docs live — tdai_wiki_search it for product, architecture, and deploy knowledge before hunting the filesystem.",
+    ],
     parameters: Type.Object({
       wiki_id: Type.String({ description: "Wiki id (from tdai_wiki_list)" }),
       query: Type.String({ description: "Search query" }),
@@ -666,6 +736,7 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI) {
     pi.on("session_start", () => {
       sessionOpened = false;
       lastAtomicFingerprint = null;
+      mapPushed = false;
     });
 
     // Compaction can summarize away the injected message just like any other
@@ -677,10 +748,25 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI) {
     // of the process life.
     pi.on("session_compact", () => {
       sessionOpened = false;
+      mapPushed = false;
     });
 
     pi.on("before_agent_start", async (event) => {
       const parts: string[] = [];
+
+      // Knowledge map first — orientation before content. Once per session, like
+      // the L2/L3 push, and re-armed after compaction for the same reason.
+      // Latched only on a successful call, so a knowledge-service outage retries
+      // next turn (mirrors `sessionOpened`).
+      if (INJECT_MAP && !mapPushed) {
+        try {
+          const mapBlock = await buildMapBlock();
+          if (mapBlock) parts.push(mapBlock);
+          mapPushed = true;
+        } catch {
+          /* fail-open: retry next turn */
+        }
+      }
 
       // The full L2/L3 push, ONCE per session — not every turn. Found in this
       // refactor, not merely inherited: once injection becomes a VISIBLE message
