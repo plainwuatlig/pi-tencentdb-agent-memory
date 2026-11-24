@@ -104,6 +104,48 @@ test("#2 tdai_wiki_write rejects more than 20 pages", async () => {
   ).rejects.toThrow(/21 pages given, max is 20/);
 });
 
+test("tdai_wiki_write content_file sends the file's exact bytes", async () => {
+  const { mkdtemp, writeFile } = await import("node:fs/promises");
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const dir = await mkdtemp(join(tmpdir(), "wiki-write-"));
+  const file = join(dir, "page.md");
+  const draft = "---\ntitle: \"T\"\n---\n\n# T\n\nreleased apps, exactly.\n";
+  await writeFile(file, draft);
+  const { seen, restore } = mockFetch(200, { code: 0, data: { ok: true } });
+  try {
+    await getTool("tdai_wiki_write").execute("1", {
+      wiki_id: "w",
+      pages: [{ ref: "a.md", content_file: file }],
+    });
+    expect(seen[0].body.pages).toEqual([{ ref: "a.md", content: draft }]);
+  } finally {
+    restore();
+  }
+});
+
+test("tdai_wiki_write needs exactly one of content or content_file", async () => {
+  const write = getTool("tdai_wiki_write");
+  await expect(
+    write.execute("1", { wiki_id: "w", pages: [{ ref: "a.md" }] }),
+  ).rejects.toThrow(/exactly one of content or content_file/);
+  await expect(
+    write.execute("1", {
+      wiki_id: "w",
+      pages: [{ ref: "a.md", content: "x", content_file: "/tmp/x.md" }],
+    }),
+  ).rejects.toThrow(/exactly one of content or content_file/);
+});
+
+test("tdai_wiki_write rejects a relative content_file", async () => {
+  await expect(
+    getTool("tdai_wiki_write").execute("1", {
+      wiki_id: "w",
+      pages: [{ ref: "a.md", content_file: "draft.md" }],
+    }),
+  ).rejects.toThrow(/must be an absolute path/);
+});
+
 test("#3 tdai_wiki_read rejects more than 20 refs", async () => {
   const refs = Array.from({ length: 21 }, (_, i) => `p${i}.md`);
   await expect(

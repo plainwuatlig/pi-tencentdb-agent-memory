@@ -19,6 +19,8 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+import { readFile } from "node:fs/promises";
+import { isAbsolute } from "node:path";
 import { Type } from "typebox";
 import {
   assembleMemoryBlock,
@@ -693,14 +695,22 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI) {
     name: "tdai_wiki_write",
     label: "TDai Wiki Write",
     description:
-      "Write or update markdown pages in one TencentDB wiki. Pages are locked during concurrent writes; a locked page fails with a lock error — retry.",
+      "Write or update markdown pages in one TencentDB wiki. Give each page either `content` or `content_file` (an absolute path whose exact bytes are stored); use `content_file` to store a draft verbatim. Pages are locked during concurrent writes; a locked page fails with a lock error — retry.",
     promptSnippet: "Write pages to a TencentDB wiki",
     parameters: Type.Object({
       wiki_id: Type.String({ description: "Wiki id (from tdai_wiki_list)" }),
       pages: Type.Array(
         Type.Object({
           ref: Type.String({ description: "Page ref/path" }),
-          content: Type.String({ description: "Markdown content" }),
+          content: Type.Optional(
+            Type.String({ description: "Markdown content" }),
+          ),
+          content_file: Type.Optional(
+            Type.String({
+              description:
+                "Absolute path of a markdown file; its exact bytes are the page content. Use instead of content to store a file verbatim.",
+            }),
+          ),
         }),
         { description: "Pages to write (max 20)" },
       ),
@@ -711,6 +721,31 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI) {
           `tdai_wiki_write: ${params.pages.length} pages given, max is 20 — split into multiple calls`,
         );
       }
+      // content_file exists so a caller can store a reviewed draft without
+      // retyping it: a model copying a page into `content` paraphrases it.
+      const pages = await Promise.all(
+        params.pages.map(async (p) => {
+          const hasContent = typeof p.content === "string";
+          const hasFile = typeof p.content_file === "string";
+          if (hasContent === hasFile) {
+            throw new Error(
+              `tdai_wiki_write: page ${p.ref} needs exactly one of content or content_file`,
+            );
+          }
+          if (!hasFile) return { ref: p.ref, content: p.content as string };
+          const file = p.content_file as string;
+          if (!isAbsolute(file)) {
+            throw new Error(
+              `tdai_wiki_write: content_file for ${p.ref} must be an absolute path, got ${file}`,
+            );
+          }
+          const content = await readFile(file, "utf8");
+          if (content.length === 0) {
+            throw new Error(`tdai_wiki_write: content_file ${file} is empty`);
+          }
+          return { ref: p.ref, content };
+        }),
+      );
       const data = await call(
         KNOWLEDGE_URL,
         "TDAI_KNOWLEDGE_URL",
@@ -718,7 +753,7 @@ export default function tdaiMemoryExtension(pi: ExtensionAPI) {
         {
           ...idFields(),
           wiki_id: params.wiki_id,
-          pages: params.pages,
+          pages,
         },
         false,
       );

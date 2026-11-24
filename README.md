@@ -25,7 +25,7 @@ Everything is **fail-open**: any tdai outage, timeout, or unset key degrades to 
 | `tdai_wiki_search` | `POST /v3/wiki/search` | BM25 full-text search inside one wiki |
 | `tdai_wiki_pages` | `POST /v3/wiki/page/ls` | List processed pages (refs) in a wiki |
 | `tdai_wiki_read` | `POST /v3/wiki/page/read` | Read up to 20 pages by ref |
-| `tdai_wiki_write` | `POST /v3/wiki/page/write` | Write/update up to 20 markdown pages (auto-locks) |
+| `tdai_wiki_write` | `POST /v3/wiki/page/write` | Write/update up to 20 markdown pages (auto-locks); each page takes `content` or `content_file`, an absolute path stored byte for byte |
 
 ## Install
 
